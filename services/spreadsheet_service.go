@@ -1,232 +1,187 @@
 package services
 
 import (
-	"encoding/csv"
+	"context"
 	"fmt"
 	"jm-CICO/config"
 	"jm-CICO/models"
 	"jm-CICO/utils"
 	"log"
-	"net/http"
 	"strings"
+	"sync"
+	"time"
+
+	"google.golang.org/api/option"
+	"google.golang.org/api/sheets/v4"
 )
 
+// Cache Structure
+type CacheEntry struct {
+	Data   []models.Entry
+	Expiry time.Time
+}
+
+var (
+	cache      = make(map[string]CacheEntry)
+	cacheMutex sync.RWMutex
+	cacheTTL   = 5 * time.Minute
+)
+
+// Helper to convert row of interface{} to []string
+func convertToStrings(row []interface{}) []string {
+	res := make([]string, len(row))
+	for i, cell := range row {
+		res[i] = fmt.Sprintf("%v", cell)
+	}
+	return res
+}
+
 func FetchData(config config.LocationConfig) ([]models.Entry, error) {
+	// 1. CACHE CHECK
+	cacheKey := config.DataRange // Using DataRange as unique key for the cache
+
+	cacheMutex.RLock()
+	if entry, found := cache[cacheKey]; found {
+		if time.Now().Before(entry.Expiry) {
+			cacheMutex.RUnlock()
+			return entry.Data, nil
+		}
+	}
+	cacheMutex.RUnlock()
+
+	// 2. FETCH FROM GOOGLE (Cache Miss or Expired)
 	sheetID := "1mBRaSCNk1TTaeJ6AJDhO1kEb7tAJSFZ1ZPhW13nVjq4"
-	sheetName := "REPORT"
 
-	// Fetch data utama
-	mainURL := fmt.Sprintf("https://docs.google.com/spreadsheets/d/%s/gviz/tq?tqx=out:csv&sheet=%s&range=%s",
-		sheetID, sheetName, config.DataRange,)
-
-	mainResp, err:= http.Get(mainURL)
+	// Setup Context and Service
+	ctx := context.Background()
+	srv, err := sheets.NewService(ctx, option.WithCredentialsFile("service-account.json"))
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch main data: %w", err)
-	}
-	defer mainResp.Body.Close()
-
-	mainReader := csv.NewReader(mainResp.Body)
-	mainReader.FieldsPerRecord = -1
-	mainData, err := mainReader.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("failed read main data: %w", err)
+		return nil, fmt.Errorf("gagal membuat client sheets: %v", err)
 	}
 
-	// Fetch kolom anggaran sesuai lokasi
-	anggaranURL := fmt.Sprintf(
-		"https://docs.google.com/spreadsheets/d/%s/gviz/tq?tqx=out:csv&sheet=%s&range=%s",
-		sheetID, sheetName, config.AnggaranRange,
-	)
-	anggaranResp, err := http.Get(anggaranURL)
-	if err != nil {
-		return nil, fmt.Errorf("gagal mengambil data anggaran: %v", err)
-	}
-	defer anggaranResp.Body.Close()
-	anggaranReader := csv.NewReader(anggaranResp.Body)
-	anggaranReader.FieldsPerRecord = -1
-	anggaranData, err := anggaranReader.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("gagal membaca data anggaran: %v", err)
+	// Define all ranges to fetch in order
+	ranges := []string{
+		fmt.Sprintf("REPORT!%s", config.DataRange),             // 0
+		fmt.Sprintf("REPORT!%s", config.AnggaranRange),         // 1
+		fmt.Sprintf("REPORT!%s", config.NopolRange),            // 2
+		fmt.Sprintf("REPORT!%s", config.PetugasRange),          // 3
+		fmt.Sprintf("REPORT!%s", config.CheckinJmlBulanRange),  // 4
+		fmt.Sprintf("REPORT!%s", config.CheckinRupiahRange),    // 5
+		fmt.Sprintf("REPORT!%s", config.CheckoutNopolRange),    // 6
+		fmt.Sprintf("REPORT!%s", config.CheckoutJmlBulanRange), // 7
+		fmt.Sprintf("REPORT!%s", config.CheckoutRupiahRange),   // 8
 	}
 
-	// fetch kolom NOPOL sesuai lokasi
-	nopoURL := fmt.Sprintf("https://docs.google.com/spreadsheets/d/%s/gviz/tq?tqx=out:csv&sheet=%s&range=%s", sheetID, sheetName, config.NopolRange,)
-
-	nopolResp, err := http.Get(nopoURL)
+	// Execute BATCH GET
+	resp, err := srv.Spreadsheets.Values.BatchGet(sheetID).Ranges(ranges...).Do()
 	if err != nil {
-		return nil, fmt.Errorf("gagal mengambil data nopol: %v", err)
-	}
-	defer nopolResp.Body.Close()
-
-	nopolReader := csv.NewReader(nopolResp.Body)
-	nopolReader.FieldsPerRecord = -1
-	nopolData, err := nopolReader.ReadAll()
-
-	if err != nil {
-		return nil, fmt.Errorf("gagal membaca data nopol: %v", err)
+		return nil, fmt.Errorf("gagal fetch batch data: %v", err)
 	}
 
-	// Fetch kolom PETUGAS sesuai lokasi
-	petugasURL := fmt.Sprintf(
-		"https://docs.google.com/spreadsheets/d/%s/gviz/tq?tqx=out:csv&sheet=%s&range=%s", sheetID, sheetName, config.PetugasRange,
-	)
-
-	petugasResp, err := http.Get(petugasURL)
-	if err != nil {
-		return nil, fmt.Errorf("gagal mengambil kolom petugas: %v", err)
-	}
-	defer petugasResp.Body.Close()
-
-	petugasReader := csv.NewReader(petugasResp.Body)
-	petugasReader.FieldsPerRecord = -1
-	petugasData, err := petugasReader.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("gagal membaca data petugas: %v", err)
+	// Map responses back (Order must match the ranges slice above)
+	if len(resp.ValueRanges) < 9 {
+		return nil, fmt.Errorf("response google sheets tidak lengkap (kurang dari 9 range)")
 	}
 
-	// Fetch data Jml Bulan (Checkin jml_bln) dari kolom AC:AD
-	jmlBlnURL := fmt.Sprintf(
-		"https://docs.google.com/spreadsheets/d/%s/gviz/tq?tqx=out:csv&sheet=%s&range=%s",
-		sheetID, sheetName, config.CheckinJmlBulanRange,
-	)
-
-	jmlBlnResp, err := http.Get(jmlBlnURL)
-	if err != nil {
-		return nil, fmt.Errorf("gagal mengambil data jmlBln: %v", err)
-	}
-	defer jmlBlnResp.Body.Close()
-
-	jmlBlnReader := csv.NewReader(jmlBlnResp.Body)
-	jmlBlnReader.FieldsPerRecord = -1
-	jmlBlnData, err := jmlBlnReader.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("gagal membaca data jmlBln: %v", err)
-	}
-
-	// Fetch data check_in rupiah 
-	rupiahURL := fmt.Sprintf("https://docs.google.com/spreadsheets/d/%s/gviz/tq?tqx=out:csv&sheet=%s&range=%s", sheetID, sheetName, config.CheckinRupiahRange)
-
-	rupiahResp, err:= http.Get(rupiahURL)
-	if err != nil {
-		return nil, fmt.Errorf("gagal mengambil data checkin rupiah: %v", err)
-	}
-	defer rupiahResp.Body.Close()
-
-	rupiahReader := csv.NewReader(rupiahResp.Body)
-	rupiahReader.FieldsPerRecord = -1
-	rupiahData, err:= rupiahReader.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("gagal membaca data checkin rupiah: %v", err)
-	}
-
-	// Fetch data checkout nopol
-	checkoutNopolURL := fmt.Sprintf("https://docs.google.com/spreadsheets/d/%s/gviz/tq?tqx=out:csv&sheet=%s&range=%s", sheetID, sheetName, config.CheckoutNopolRange)
-	checkoutNopolResp, err := http.Get(checkoutNopolURL)
-	if err != nil {
-		return nil, fmt.Errorf("gagal mengambil data checkout nopol: %v", err)
-	}
-	defer checkoutNopolResp.Body.Close()
-	checkoutNopolReader := csv.NewReader(checkoutNopolResp.Body)
-	checkoutNopolReader.FieldsPerRecord = -1
-	checkoutNopolData, err := checkoutNopolReader.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("gagal membaca data checkout nopol: %v", err)
-	}	
-
-	// Fetch data checkout jml_bln
-	checkoutJmlBlnURL := fmt.Sprintf("https://docs.google.com/spreadsheets/d/%s/gviz/tq?tqx=out:csv&sheet=%s&range=%s", sheetID, sheetName, config.CheckoutJmlBulanRange)
-	checkoutJmlBlnResp, err := http.Get(checkoutJmlBlnURL)
-	if err != nil {
-		return nil, fmt.Errorf("gagal mengambil data checkout jml_bln: %v", err)
-	}
-	defer checkoutJmlBlnResp.Body.Close()
-	checkoutJmlBlnReader := csv.NewReader(checkoutJmlBlnResp.Body)
-	checkoutJmlBlnReader.FieldsPerRecord = -1
-	checkoutJmlBlnData, err := checkoutJmlBlnReader.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("gagal membaca data checkout jml_bln: %v", err)
-	}
-
-
-	// Fetch data checkout rupiah
-	checkoutRupiahURL := fmt.Sprintf("https://docs.google.com/spreadsheets/d/%s/gviz/tq?tqx=out:csv&sheet=%s&range=%s", sheetID, sheetName, config.CheckoutRupiahRange)
-	checkoutRupiahResp, err := http.Get(checkoutRupiahURL)
-	if err != nil {
-		return nil, fmt.Errorf("gagal mengambil data checkout rupiah: %v", err)
-	}
-	defer checkoutRupiahResp.Body.Close()
-	checkoutRupiahReader := csv.NewReader(checkoutRupiahResp.Body)
-	checkoutRupiahReader.FieldsPerRecord = -1
-	checkoutRupiahData, err := checkoutRupiahReader.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("gagal membaca data checkout rupiah: %v", err)
-	}
+	mainDataRaw := resp.ValueRanges[0].Values
+	anggaranDataRaw := resp.ValueRanges[1].Values
+	nopolDataRaw := resp.ValueRanges[2].Values
+	petugasDataRaw := resp.ValueRanges[3].Values
+	jmlBlnDataRaw := resp.ValueRanges[4].Values
+	rupiahDataRaw := resp.ValueRanges[5].Values
+	checkoutNopolDataRaw := resp.ValueRanges[6].Values
+	checkoutJmlBlnDataRaw := resp.ValueRanges[7].Values
+	checkoutRupiahDataRaw := resp.ValueRanges[8].Values
 
 	var entries []models.Entry
-	for i, row:= range mainData{
-		if utils.IsEmptyRow(row) || utils.IsHeaderRow(row) || i >= len(anggaranData) || i >= len(petugasData) || i >= len(nopolData) || i >= len(jmlBlnData) || i > len(rupiahData) || i > len(checkoutNopolData) || i > len(checkoutJmlBlnData) || i > len(checkoutRupiahData) {
-			continue
-		}
-		
-		entry, err := utils.ParseEntry(row)
-		if err!= nil {
-			log.Printf("failed fetch the row: %v | Error: %v", row, err)
+
+	// Loop through Main Data
+	for i, rowRaw := range mainDataRaw {
+		row := convertToStrings(rowRaw)
+
+		// Validate bounds against ALL other datasets to prevent panic
+		if utils.IsEmptyRow(row) || utils.IsHeaderRow(row) ||
+			i >= len(anggaranDataRaw) ||
+			i >= len(petugasDataRaw) ||
+			i >= len(nopolDataRaw) ||
+			i >= len(jmlBlnDataRaw) ||
+			i >= len(rupiahDataRaw) ||
+			i >= len(checkoutNopolDataRaw) ||
+			i >= len(checkoutJmlBlnDataRaw) ||
+			i >= len(checkoutRupiahDataRaw) {
 			continue
 		}
 
-		// Gabungkan nama petugas dari O→V (kolom 0 sampai 7)
+		entry, err := utils.ParseEntry(row)
+		if err != nil {
+			log.Printf("failed parse row: %v", err)
+			continue
+		}
+
+		// --- OVERWRITE FIELDS WITH COLUMN DATA ---
+
+		// Petugas (Column O->V, joined)
+		petugasRow := convertToStrings(petugasDataRaw[i])
 		fullName := ""
-		for _, col := range petugasData[i] {
-			part := strings.TrimSpace(col)
-			if part != "" {
-				fullName += part + " "
+		for _, part := range petugasRow {
+			p := strings.TrimSpace(part)
+			if p != "" {
+				fullName += p + " "
 			}
 		}
 		entry.Petugas = strings.TrimSpace(fullName)
 
-		// Ambil anggaran dari kolom W dan X
-		anggaranStr := strings.Join(anggaranData[i], "")
-		entry.Anggaran = utils.ParseNumber(anggaranStr)
+		// Anggaran
+		anggaranRow := convertToStrings(anggaranDataRaw[i])
+		entry.Anggaran = utils.ParseNumber(strings.Join(anggaranRow, ""))
 
-		// Ambil nopol checkin dari kolom AA dan AB
-		nopolStr := strings.Join(nopolData[i], "")
-		entry.Checkin.Nopol = utils.ParseInt(nopolStr)
+		// Nopol Checkin
+		nopolRow := convertToStrings(nopolDataRaw[i])
+		entry.Checkin.Nopol = utils.ParseInt(strings.Join(nopolRow, ""))
 
-		// Masukkan Rubian dari kolom AC:AD
-		jmlBlnStr := strings.Join(jmlBlnData[i], "")
-		entry.Checkin.JumlahBulan = utils.ParseInt(jmlBlnStr)
+		// Jml Bulan Checkin
+		jmlBlnRow := convertToStrings(jmlBlnDataRaw[i])
+		entry.Checkin.JumlahBulan = utils.ParseInt(strings.Join(jmlBlnRow, ""))
 
-		// Masukkan ciRupiah dari kolom
-		entry.Checkin.Rupiah = utils.ParseNumber(strings.Join(rupiahData[i], ""))
+		// Rupiah Checkin
+		rupiahRow := convertToStrings(rupiahDataRaw[i])
+		entry.Checkin.Rupiah = utils.ParseNumber(strings.Join(rupiahRow, ""))
 
-		// Ambil nopol checkout dari kolom AI dan AJ
-		checkoutNopolStr := strings.Join(checkoutNopolData[i], "")
-		entry.Checkout.Nopol = utils.ParseInt(checkoutNopolStr)
+		// Checkout Nopol
+		coNopolRow := convertToStrings(checkoutNopolDataRaw[i])
+		entry.Checkout.Nopol = utils.ParseInt(strings.Join(coNopolRow, ""))
 
-		// Ambil jml_bln checkout dari kolom AK dan AL
-		checkoutJmlBlnStr := strings.Join(checkoutJmlBlnData[i], "")
-		entry.Checkout.JumlahBulan = utils.ParseInt(checkoutJmlBlnStr)
+		// Checkout Jml Bulan
+		coJmlBlnRow := convertToStrings(checkoutJmlBlnDataRaw[i])
+		entry.Checkout.JumlahBulan = utils.ParseInt(strings.Join(coJmlBlnRow, ""))
 
-		// Ambil checkout rupiah dari kolom AM:AP
-		checkoutRupiahStr := strings.Join(checkoutRupiahData[i], "")
-		entry.Checkout.Rupiah = utils.ParseNumber(checkoutRupiahStr)
+		// Checkout Rupiah
+		coRupiahRow := convertToStrings(checkoutRupiahDataRaw[i])
+		entry.Checkout.Rupiah = utils.ParseNumber(strings.Join(coRupiahRow, ""))
 
-		// hitungan selisih CICO
+		// Calculate Diff
 		entry.SelisihCICO.Nopol = entry.Checkout.Nopol - entry.Checkin.Nopol
-
 		entry.SelisihCICO.JumlahBulan = entry.Checkout.JumlahBulan - entry.Checkin.JumlahBulan
-
 		entry.SelisihCICO.Rupiah = entry.Checkout.Rupiah - entry.Checkin.Rupiah
-		
+
 		entries = append(entries, entry)
 	}
+
+	// 3. SAVE TO CACHE
+	cacheMutex.Lock()
+	cache[cacheKey] = CacheEntry{
+		Data:   entries,
+		Expiry: time.Now().Add(cacheTTL),
+	}
+	cacheMutex.Unlock()
+
 	return entries, nil
 }
 
 func CalculateSubtotal(entries []models.Entry) models.Subtotal {
 	var st models.Subtotal
 
-	for _, entry := range entries{
+	for _, entry := range entries {
 		st.Anggaran += entry.Anggaran
 		st.CheckinNopol += entry.Checkin.Nopol
 		st.CheckinJmlBln += entry.Checkin.JumlahBulan
