@@ -1,7 +1,9 @@
 package utils
 
 import (
+	"crypto/rand"
 	"fmt"
+	"log"
 	"os"
 	"time"
 
@@ -9,12 +11,22 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-func GetJWTKey() []byte {
+var jwtSecret []byte
+
+func init() {
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" {
-		return []byte("default_secure_fallback_key_2026")
+		log.Println("WARNING: JWT_SECRET not found in .env, generating a random one for this session. Users will be logged out on restart.")
+		bytes := make([]byte, 32)
+		rand.Read(bytes)
+		jwtSecret = bytes
+	} else {
+		jwtSecret = []byte(secret)
 	}
-	return []byte(secret)
+}
+
+func GetJWTKey() []byte {
+	return jwtSecret
 }
 
 func HashPassword(password string) (string, error) {
