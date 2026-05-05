@@ -33,13 +33,18 @@ func CacheMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 		key := r.URL.Path
 
-		// Attempt to fetch from cache
-		cachedData := GetCache(key)
-		if cachedData != nil {
-			// Serve from cache
-			w.Header().Set("Content-Type", "application/json")
-			w.Write(cachedData)
-			return
+		// Force refresh if this is the internal prewarmer
+		forceRefresh := r.Header.Get("X-Prewarm") == PrewarmSecret
+
+		// Attempt to fetch from cache only if not forcing refresh
+		if !forceRefresh {
+			cachedData := GetCache(key)
+			if cachedData != nil {
+				// Serve from cache
+				w.Header().Set("Content-Type", "application/json")
+				w.Write(cachedData)
+				return
+			}
 		}
 
 		// Not in cache, we need to capture the output
