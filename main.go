@@ -7,14 +7,39 @@ import (
 	"jm-CICO/utils"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 
 	"github.com/joho/godotenv"
 )
 
 func main() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Println("Warning: .env file not found, using system environment variables")
+	// Load .env - coba beberapa lokasi
+	envLoaded := false
+
+	// 1. Coba dari folder executable (resolve symlink Windows)
+	if exePath, err := os.Executable(); err == nil {
+		if realPath, err := filepath.EvalSymlinks(exePath); err == nil {
+			exePath = realPath
+		}
+		envPath := filepath.Join(filepath.Dir(exePath), ".env")
+		log.Printf("[ENV] Trying: %s", envPath)
+		if err := godotenv.Load(envPath); err == nil {
+			log.Printf("[ENV] Loaded from exe dir: %s", envPath)
+			envLoaded = true
+		}
+	}
+
+	// 2. Fallback: working directory
+	if !envLoaded {
+		if err := godotenv.Load(); err == nil {
+			log.Println("[ENV] Loaded from working directory")
+			envLoaded = true
+		}
+	}
+
+	if !envLoaded {
+		log.Println("[ENV] Warning: .env not found, using system environment variables")
 	}
 
 	config.InitDB()
