@@ -8,12 +8,16 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/joho/godotenv"
 	"golang.org/x/crypto/bcrypt"
 )
 
 var jwtSecret []byte
 
 func init() {
+	// Load .env proactively before fetching environment variables
+	_ = godotenv.Load("../.env", ".env")
+	
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" {
 		log.Println("WARNING: JWT_SECRET not found in .env, generating a random one for this session. Users will be logged out on restart.")
@@ -26,6 +30,9 @@ func init() {
 }
 
 func GetJWTKey() []byte {
+	if secret := os.Getenv("JWT_SECRET"); secret != "" {
+		return []byte(secret)
+	}
 	return jwtSecret
 }
 
